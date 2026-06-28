@@ -35,14 +35,6 @@ brew tap echochamber/tap
 brew install claudegrep
 ```
 
-### pip / pipx / uvx
-
-```bash
-pipx install claudegrep      # isolated, on your PATH
-uvx claudegrep "webhook"     # run without installing
-pip install claudegrep       # into the current environment
-```
-
 ### Install script
 
 ```bash
