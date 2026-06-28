@@ -1,0 +1,1378 @@
+#!/usr/bin/env python3
+"""claudegrep — search Claude Code conversation logs.
+
+Searches the JSONL session transcripts under ~/.claude/projects and renders
+rich, session-grouped results. Uses a fast candidate-file pre-filter when
+available and does a single parse pass per file in Python — no per-result
+subprocess fan-out, so it stays well under a second for typical queries.
+
+Stdlib only. The pre-filter falls back through ripgrep → grep → a pure-Python
+scan, so it works with whatever is installed (just slower without `rg`).
+
+Usage:
+  claudegrep <pattern>              search conversation text (user + assistant)
+  claudegrep -u <pattern>           user messages only
+  claudegrep -a <pattern>           assistant messages only
+  claudegrep -p <project> <pattern> filter to a project (dir-name substring)
+  claudegrep -m <N> <pattern>       cap results (default 25; -n is an alias)
+  claudegrep --all-content <pat>    also search tool calls + tool output
+  claudegrep --list-projects        list projects
+  claudegrep                        (no pattern) recent-sessions dashboard
+
+Run `claudegrep --help` for the full flag list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ── Theme ────────────────────────────────────────────────────────────────────
+# Truecolor palette (matches the original tool's design).
+
+
+class Theme:
+    """ANSI palette. All codes collapse to '' when color is disabled."""
+
+    NAMES = {
+        "RESET": "\033[0m",
+        "BOLD": "\033[1m",
+        "DIM": "\033[2m",
+        "ITALIC": "\033[3m",
+        "ORANGE": "\033[38;2;255;150;50m",
+        "PEACH": "\033[38;2;255;180;120m",
+        "CORAL": "\033[38;2;255;120;100m",
+        "TEAL": "\033[38;2;100;220;200m",
+        "SLATE": "\033[38;2;130;150;170m",
+        "SKY": "\033[38;2;120;180;255m",
+        "LAVENDER": "\033[38;2;180;160;255m",
+        "MINT": "\033[38;2;120;230;170m",
+        "CLOUD": "\033[38;2;80;90;105m",
+        "WHITE": "\033[38;2;230;235;240m",
+        "FAINT": "\033[38;2;90;100;110m",
+        "GOLD": "\033[38;2;220;190;100m",
+        "BG_BOX": "\033[48;2;25;32;42m",
+        "BG_RESET": "\033[49m",
+    }
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        for name, code in self.NAMES.items():
+            setattr(self, name, code if enabled else "")
+
+
+BOX_W = 68  # inner width of the session header box
+DEFAULT_MAX = 25
+def _resolve_projects_dir() -> Path:
+    """Where transcripts live. Override with CLAUDEGREP_PROJECTS_DIR to search a
+    copied/archived projects tree — or a generated demo corpus for screenshots."""
+    return Path(os.environ.get("CLAUDEGREP_PROJECTS_DIR")
+                or os.path.expanduser("~/.claude/projects"))
+
+
+PROJECTS_DIR = _resolve_projects_dir()
+
+# Substring gate: only JSON-decode lines that can carry what we need. Claude Code
+# writes compact JSON, so these literals are reliable and let us skip the many
+# attachment / file-history-snapshot / mode records without paying json.loads.
+_GATE = (b'"type":"user"', b'"type":"assistant"', b'"type":"ai-title"')
+
+# Topic-fallback noise: a first-user-message that starts with any of these is an
+# injected/system turn, not a human prompt.
+_TOPIC_NOISE_PREFIXES = ("<", "[Request", "{", "This session is being continued")
+
+
+# ── Data model ───────────────────────────────────────────────────────────────
+
+
+class Match:
+    __slots__ = (
+        "text", "msg_type", "timestamp", "uuid", "lineno",
+        "pos", "total", "upos", "utotal", "session",
+    )
+
+    def __init__(self, text, msg_type, timestamp, uuid, lineno,
+                 pos, total, upos, utotal, session):
+        self.text = text
+        self.msg_type = msg_type
+        self.timestamp = timestamp
+        self.uuid = uuid
+        self.lineno = lineno
+        self.pos = pos
+        self.total = total
+        self.upos = upos
+        self.utotal = utotal
+        self.session = session
+
+
+class Session:
+    __slots__ = (
+        "session_id", "path", "project", "topic",
+        "branch", "cwd", "start_ts", "end_ts", "is_subagent",
+    )
+
+    def __init__(self, session_id, path, project, topic, branch, cwd,
+                 start_ts, end_ts, is_subagent):
+        self.session_id = session_id
+        self.path = path
+        self.project = project
+        self.topic = topic
+        self.branch = branch
+        self.cwd = cwd
+        self.start_ts = start_ts
+        self.end_ts = end_ts
+        self.is_subagent = is_subagent
+
+
+# ── Display-width helpers (wide chars / emoji aware) ──────────────────────────
+
+
+def display_width(s: str) -> int:
+    """Visible column width of a plain string (no ANSI). Treats East-Asian
+    wide/fullwidth as 2 cells and combining marks as 0."""
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def truncate_to_width(s: str, target: int) -> str:
+    """Truncate a plain string so its display width is <= target."""
+    if display_width(s) <= target:
+        return s
+    out, w = [], 0
+    for ch in s:
+        cw = 0 if unicodedata.combining(ch) else (
+            2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if w + cw > target:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def pad_to(s: str, target: int) -> str:
+    """Right-pad a plain string to `target` display columns (or truncate)."""
+    w = display_width(s)
+    if w < target:
+        return s + " " * (target - w)
+    return truncate_to_width(s, target)
+
+
+# ── Timestamp helpers ─────────────────────────────────────────────────────────
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def parse_ts(ts: str):
+    """Parse an ISO-8601 'Z' timestamp into an aware datetime, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def fmt_ts_long(ts: str) -> str:
+    dt = parse_ts(ts)
+    if not dt:
+        return ""
+    return f"{_MONTHS[dt.month - 1]} {dt.day}, {dt.hour:02d}:{dt.minute:02d}"
+
+
+def fmt_ts_short(ts: str) -> str:
+    dt = parse_ts(ts)
+    if not dt:
+        return ""
+    return f"{dt.hour:02d}:{dt.minute:02d}"
+
+
+# ── Content / surface extraction ──────────────────────────────────────────────
+
+
+def _stringify_tool_input(value) -> str:
+    """Flatten a tool_use input value into searchable text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_stringify_tool_input(v) for v in value.values())
+    if isinstance(value, list):
+        return " ".join(_stringify_tool_input(v) for v in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def record_text(rec: dict, all_content: bool) -> str:
+    """Searchable/displayable text for a user|assistant record.
+
+    Default surface = conversation prose (text blocks + string content).
+    With all_content=True, also include tool_use inputs and tool_result output.
+    `thinking` blocks are empty in the corpus and always skipped.
+    """
+    msg = rec.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+
+    parts = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                t = block.get("text")
+                if t:
+                    parts.append(t)
+            elif btype == "tool_use" and all_content:
+                name = block.get("name")
+                if name:
+                    parts.append(name)
+                parts.append(_stringify_tool_input(block.get("input")))
+            elif btype == "tool_result" and all_content:
+                c = block.get("content")
+                if isinstance(c, str):
+                    parts.append(c)
+                elif isinstance(c, list):
+                    for sub in c:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            t = sub.get("text")
+                            if t:
+                                parts.append(t)
+            # thinking / image: skipped
+    return "\n".join(p for p in parts if p)
+
+
+# ── File discovery ────────────────────────────────────────────────────────────
+
+
+def walk_transcripts():
+    """Yield (main_files, subagent_files) under PROJECTS_DIR, following NO
+    symlinks. ~/.claude/projects contains hundreds of symlinked worktree dirs
+    that point back to canonical project dirs; Path.glob would follow them and
+    return the same files hundreds of times, so we walk explicitly."""
+    main, sub = [], []
+    if not PROJECTS_DIR.is_dir():
+        return main, sub
+    for root, dirs, files in os.walk(PROJECTS_DIR, followlinks=False):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            p = Path(root) / name
+            (sub if f"{os.sep}subagents{os.sep}" in str(p) else main).append(p)
+    return main, sub
+
+
+def discover_files(args) -> list[Path]:
+    """Resolve the set of transcript files to scan, honoring --session, --last,
+    -p/--project, and --include-subagents."""
+    main, sub = walk_transcripts()
+
+    # --session: resolve to the single (largest, to dodge stub collisions) file.
+    if args.session:
+        cands = [p for p in main if p.stem == args.session]
+        if args.include_subagents:
+            cands += [p for p in sub if p.stem == args.session]
+        if not cands:  # prefix match fallback
+            cands = [p for p in main if p.stem.startswith(args.session)]
+        if not cands:
+            return []
+        return [max(cands, key=lambda p: p.stat().st_size)]
+
+    files = main + sub if args.include_subagents else main
+
+    if args.project:
+        # Match the project DIRECTORY name (basename), not the full path — the
+        # old tool matched the shared "~/.claude/projects/" prefix, a no-op.
+        needle = args.project.lower()
+        files = [p for p in files if needle in project_of(p).lower()]
+
+    if args.last:
+        if not files:
+            return []
+        return [max(files, key=lambda p: p.stat().st_mtime)]
+
+    return files
+
+
+def project_dir_of(path: Path) -> Path:
+    """The canonical project directory containing this transcript."""
+    s = str(path)
+    if f"{os.sep}subagents{os.sep}" in s:
+        return path.parents[2]  # projects/<PROJ>/<sid>/subagents/<file>
+    return path.parent          # projects/<PROJ>/<sid>.jsonl
+
+
+def project_of(path: Path) -> str:
+    return project_dir_of(path).name
+
+
+# ── ripgrep candidate pre-filter ──────────────────────────────────────────────
+
+
+def _rg_match_flags(args) -> list:
+    flags = []
+    if args.fixed_strings:
+        flags.append("-F")
+    if args.word:
+        flags.append("-w")
+    if not args.case_sensitive:
+        flags.append("-i")
+    return flags
+
+
+def rg_list_files(pattern: str, files: list[Path], args) -> list | None:
+    """Fast `rg -l`: which of `files` contain the pattern (raw bytes). Returns a
+    list of Paths, or None if rg is unavailable / errors."""
+    rg = shutil.which("rg")
+    if not rg or not files:
+        return None
+    roots = sorted({str(project_dir_of(p)) for p in files})
+    cmd = ([rg, "-l", "--no-messages", "-g", "*.jsonl"] + _rg_match_flags(args)
+           + ["-e", pattern, "--"] + roots)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    wanted = {str(p): p for p in files}
+    return [wanted[h] for h in proc.stdout.splitlines() if h in wanted]
+
+
+def rg_batch(files, pattern: str, args):
+    """Map {file_path -> [(lineno, raw_json_text), ...]} for a batch of files via
+    one `rg --json` call. rg already reads the files and returns the full
+    matching lines, so the gather phase never reads transcripts itself — it
+    parses these directly. rg is only a candidate filter; Python re-checks the
+    search surface. Returns None if rg errors (caller full-scans the batch)."""
+    rg = shutil.which("rg")
+    if not rg or not files:
+        return None
+    cmd = ([rg, "--json", "--no-messages"] + _rg_match_flags(args)
+           + ["-e", pattern, "--"] + [str(p) for p in files])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    out = {}
+    for line in proc.stdout.split("\n"):
+        if not line.startswith('{"type":"match"'):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        d = ev.get("data", {})
+        path = d.get("path", {}).get("text")
+        ln = d.get("line_number")
+        txt = (d.get("lines") or {}).get("text")
+        if path and ln and txt is not None:
+            out.setdefault(path, []).append((ln, txt.rstrip("\n")))
+    return out
+
+
+# ── grep candidate pre-filter (used when ripgrep is unavailable) ──────────────
+
+
+def _grep_match_flags(args) -> list:
+    flags = ["-a"]  # treat transcripts as text even if a line looks binary
+    if not args.case_sensitive:
+        flags.append("-i")
+    if args.word:
+        flags.append("-w")
+    flags.append("-F" if args.fixed_strings else "-E")
+    return flags
+
+
+def _grep_can_handle(args) -> bool:
+    """grep is only a candidate filter, but it must be a faithful SUPERSET of the
+    Python `re` match or we'd silently drop results. Fixed strings always are.
+    For regex, POSIX ERE lacks the Perl-isms below (and BSD grep lacks even the
+    GNU \\d/\\w/\\b extensions), so we decline and let Python's full engine run."""
+    if args.fixed_strings:
+        return True
+    pat = args.pattern or ""
+    risky = (r"\d", r"\D", r"\w", r"\W", r"\s", r"\S", r"\b", r"\B",
+             r"\A", r"\Z", r"\z", "(?")
+    return not any(tok in pat for tok in risky)
+
+
+def grep_batch(files, pattern: str, args):
+    """`grep -n -H` equivalent of rg_batch → {path: [(lineno, raw_json_text)]}.
+    grep prints `path:lineno:line`; corpus paths contain no ':' so a 2-split is
+    unambiguous (and we drop anything whose path isn't one we asked for)."""
+    grep = shutil.which("grep")
+    if not grep or not files:
+        return None
+    cmd = ([grep, "-n", "-H"] + _grep_match_flags(args)
+           + ["-e", pattern, "--"] + [str(p) for p in files])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    wanted = {str(p) for p in files}
+    out = {}
+    for line in proc.stdout.split("\n"):
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        path, num, text = parts
+        if num.isdigit() and path in wanted:
+            out.setdefault(path, []).append((int(num), text))
+    return out
+
+
+# ── Backend selection: ripgrep → grep → pure-Python ───────────────────────────
+
+
+def choose_backend(args) -> str | None:
+    """Pick the best available pre-filter for this pattern: 'rg', 'grep', or None
+    (pure-Python full scan).
+
+    rg gets a cheap `rg -l` candidate-narrowing pass up front; grep does not
+    (a full `grep -l` over the corpus would cost as much as the search itself),
+    so grep rides the batched early-stop path in gather_matches directly."""
+    if shutil.which("rg"):
+        return "rg"
+    if shutil.which("grep") and _grep_can_handle(args):
+        return "grep"
+    return None
+
+
+def search_batch(backend, files, pattern, args):
+    if backend == "rg":
+        return rg_batch(files, pattern, args)
+    if backend == "grep":
+        return grep_batch(files, pattern, args)
+    return None
+
+
+# ── Pattern compilation (single engine: Python re) ────────────────────────────
+
+
+def compile_pattern(args):
+    pat = args.pattern
+    if args.fixed_strings:
+        rx = re.escape(pat)
+    else:
+        rx = pat
+    if args.word:
+        rx = r"\b(?:" + rx + r")\b"
+    flags = 0 if args.case_sensitive else re.IGNORECASE
+    try:
+        return re.compile(rx, flags)
+    except re.error as e:
+        sys.stderr.write(f"claudegrep: invalid pattern: {e}\n")
+        sys.exit(2)
+
+
+def resolve_case_sensitivity(args):
+    """Smart-case: case-insensitive unless the pattern has an uppercase letter,
+    overridable by -s/-i."""
+    if args.ignore_case:
+        args.case_sensitive = False
+    elif args.case_sensitive:
+        pass  # -s forces sensitive
+    else:  # smart-case: sensitive iff the pattern contains an uppercase letter
+        args.case_sensitive = bool(re.search(r"[A-Z]", args.pattern or ""))
+
+
+# ── Scanning ──────────────────────────────────────────────────────────────────
+
+# Byte-level helpers for the fast path (compact JSON ⇒ these literals only ever
+# appear as the actual top-level key, never inside an escaped string value).
+_TS_RE = re.compile(rb'"timestamp":"([^"]+)"')
+_AITITLE_RE = re.compile(rb'"aiTitle":"((?:[^"\\]|\\.)*)"')
+_USER_KEY = b'"type":"user"'
+_ASST_KEY = b'"type":"assistant"'
+
+
+def _eligible_types(args) -> set:
+    if args.user_only:
+        return {"user"}
+    if args.assistant_only:
+        return {"assistant"}
+    return {"user", "assistant"}
+
+
+def scan_matches_light(path: Path, matched, regex, args):
+    """Phase A: turn rg's `(lineno, raw_json)` hits for one file into confirmed
+    matches — json.loads only the matched lines, no full-file read. Position
+    index and topic are deferred to enrich_session() for the displayed set only.
+    Returns (Session, [Match]) with pos/total left at 0, or None."""
+    eligible = _eligible_types(args)
+    sid = branch = cwd = None
+    out = []
+    for (ln, text) in matched:
+        try:
+            rec = json.loads(text)
+        except ValueError:
+            continue
+        t = rec.get("type")
+        if t not in eligible:
+            continue
+        surf = record_text(rec, args.all_content)
+        if not surf or not regex.search(surf):
+            continue
+        if sid is None:
+            sid = rec.get("sessionId")
+            branch = rec.get("gitBranch")
+            cwd = rec.get("cwd")
+        out.append(Match(
+            text=surf, msg_type=t, timestamp=rec.get("timestamp"),
+            uuid=rec.get("uuid"), lineno=ln,
+            pos=0, total=0, upos=0, utotal=0, session=None))
+    if not out:
+        return None
+    # Provisional recency from the matched lines' own timestamps (no file read).
+    # enrich_session() later replaces this with the true full-session span; the
+    # provisional value is a lower bound, so it only ever ranks a session lower
+    # than its real recency, never higher.
+    ts = [m.timestamp for m in out if m.timestamp]
+    session = _make_session(sid or path.stem, path, "", branch, cwd,
+                            min(ts) if ts else None, max(ts) if ts else None)
+    for m in out:
+        m.session = session
+    return (session, out)
+
+
+def enrich_session(session: Session):
+    """Phase B: read one file fully to fill the session topic, true start/end
+    timestamps, and the per-line position index. Returns the lineno→(pos, total,
+    upos, utotal) map. Only ever called for the handful of displayed sessions."""
+    try:
+        with open(session.path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return {}
+
+    ts_all = _TS_RE.findall(data)
+    session.start_ts = min(ts_all).decode("utf-8", "replace") if ts_all else None
+    session.end_ts = max(ts_all).decode("utf-8", "replace") if ts_all else None
+
+    titles = _AITITLE_RE.findall(data)
+    ai_title = None
+    if titles:
+        try:
+            ai_title = json.loads(b'"' + titles[-1] + b'"')
+        except ValueError:
+            ai_title = None
+
+    pos = upos = 0
+    first_user_raw = None
+    idx = {}  # lineno -> (pos, is_user, upos_at_line)
+    for ln, raw in enumerate(data.split(b"\n"), 1):
+        is_user = _USER_KEY in raw
+        is_asst = (not is_user) and _ASST_KEY in raw
+        if not (is_user or is_asst):
+            continue
+        pos += 1
+        if is_user:
+            upos += 1
+            if first_user_raw is None:
+                first_user_raw = raw
+        idx[ln] = (pos, is_user, upos if is_user else 0)
+
+    topic = ai_title
+    if not topic and first_user_raw is not None:
+        topic = _fallback_topic_from_raw(first_user_raw)
+    session.topic = topic or f"Session {session.session_id[:8]}…"
+
+    total, utotal = pos, upos
+    return {ln: (p, total, up, utotal) for ln, (p, _iu, up) in idx.items()}
+
+
+def scan_file_full(path: Path, regex, args):
+    """Full path (no rg, or a regex rg can't compile): json.loads every
+    user/assistant/ai-title line. Same result as the fast path, just slower."""
+    ai_title = None
+    sid = branch = cwd = None
+    conv = []  # (type, uuid, ts, lineno, text)
+
+    try:
+        with open(path, "rb") as f:
+            for lineno, raw in enumerate(f, 1):
+                if not any(g in raw for g in _GATE):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                t = rec.get("type")
+                if t == "ai-title":
+                    at = rec.get("aiTitle")
+                    if at:
+                        ai_title = at
+                    continue
+                if t not in ("user", "assistant"):
+                    continue
+                if sid is None:
+                    sid = rec.get("sessionId")
+                    branch = rec.get("gitBranch")
+                    cwd = rec.get("cwd")
+                conv.append((t, rec.get("uuid"), rec.get("timestamp"),
+                             lineno, record_text(rec, args.all_content)))
+    except OSError:
+        return None
+    if not conv:
+        return None
+
+    total = len(conv)
+    utotal = sum(1 for r in conv if r[0] == "user")
+    timed = [r[2] for r in conv if r[2]]
+    topic = ai_title or _fallback_topic(conv) or f"Session {(sid or '')[:8]}…"
+    session = _make_session(sid or path.stem, path, topic, branch, cwd,
+                            min(timed) if timed else None,
+                            max(timed) if timed else None)
+
+    eligible = _eligible_types(args)
+    matches = []
+    pos = upos = 0
+    for (mtype, uuid, ts, lineno, text) in conv:
+        pos += 1
+        if mtype == "user":
+            upos += 1
+        if mtype not in eligible or not text or not regex.search(text):
+            continue
+        matches.append(Match(
+            text=text, msg_type=mtype, timestamp=ts, uuid=uuid, lineno=lineno,
+            pos=pos, total=total, upos=(upos if mtype == "user" else 0),
+            utotal=utotal, session=session))
+    return (session, matches)
+
+
+def _make_session(sid, path, topic, branch, cwd, start_ts, end_ts):
+    return Session(
+        session_id=sid, path=path, project=project_of(path),
+        topic=topic or "(untitled session)", branch=branch, cwd=cwd,
+        start_ts=start_ts, end_ts=end_ts,
+        is_subagent=f"{os.sep}subagents{os.sep}" in str(path))
+
+
+def _fallback_topic_from_raw(raw: bytes) -> str:
+    try:
+        rec = json.loads(raw)
+    except ValueError:
+        return ""
+    return _fallback_topic([("user", None, None, 0, record_text(rec, False))])
+
+
+def _fallback_topic(conv) -> str:
+    """First human-looking user message when no ai-title exists."""
+    for (mtype, _uuid, _ts, _ln, text) in conv:
+        if mtype != "user" or not text:
+            continue
+        t = text.strip()
+        if len(t) <= 10:
+            continue
+        if t.startswith(_TOPIC_NOISE_PREFIXES):
+            continue
+        if t.startswith("Caveat:"):
+            continue
+        return t[:60]
+    return ""
+
+
+# ── Date filtering ────────────────────────────────────────────────────────────
+
+
+def build_date_window(args):
+    lo = hi = None
+    now = datetime.now(timezone.utc)
+    if args.days is not None:
+        lo = now - timedelta(days=args.days)
+    if args.since:
+        lo = _parse_user_date(args.since) or lo
+    if args.until:
+        hi = _parse_user_date(args.until)
+    return lo, hi
+
+
+def _parse_user_date(s: str):
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def in_window(ts: str, lo, hi) -> bool:
+    if lo is None and hi is None:
+        return True
+    dt = parse_ts(ts)
+    if dt is None:
+        return False
+    if lo and dt < lo:
+        return False
+    if hi and dt > hi:
+        return False
+    return True
+
+
+# ── Result assembly ───────────────────────────────────────────────────────────
+
+
+def _keep_match(m, session, lo, hi, args) -> bool:
+    if args.branch and (not session.branch
+                        or args.branch.lower() not in session.branch.lower()):
+        return False
+    if args.cwd and (not session.cwd
+                     or args.cwd.lower() not in session.cwd.lower()):
+        return False
+    return in_window(m.timestamp, lo, hi)
+
+
+def gather_matches(files: list[Path], backend, pattern, regex, args, stop_after=None):
+    """Scan candidate files (newest-first) and return (matches, stopped_early).
+
+    Matches come back in recency-proxy order (file mtime, then line order); the
+    caller truncates to the display count, enriches that set, and does the final
+    accurate sort. `stop_after` bounds work for very common patterns;
+    `stop_after=None` scans everything (used for --count).
+
+    With a search backend ('rg' or 'grep'), files are processed in geometrically
+    growing batches (1, 2, 4, …) in one backend call each: dense patterns
+    early-stop after a tiny batch, while sparse-but-widespread patterns cost only
+    ~log(N) invocations instead of one per file. `backend=None` does a pure-Python
+    full parse of every file."""
+    lo, hi = build_date_window(args)
+    flat = []
+    stopped = False
+
+    def absorb(session, matches):
+        flat.extend(m for m in matches if _keep_match(m, session, lo, hi, args))
+
+    if not backend:
+        for idx, path in enumerate(files):
+            res = scan_file_full(path, regex, args)
+            if res:
+                absorb(*res)
+            if stop_after is not None and len(flat) >= stop_after:
+                stopped = idx < len(files) - 1  # only "more" if files remain
+                break
+        return flat, stopped
+
+    i, n, batch = 0, len(files), 1
+    while i < n:
+        chunk = files[i:i + batch]
+        i += batch
+        batch = min(batch * 2, 256)
+        bm = search_batch(backend, chunk, pattern, args)
+        for path in chunk:  # preserve mtime order within the batch
+            if bm is None:                       # backend errored → full scan
+                res = scan_file_full(path, regex, args)
+            else:
+                matched = bm.get(str(path))
+                res = scan_matches_light(path, matched, regex, args) if matched else None
+            if res:
+                absorb(*res)
+        if stop_after is not None and len(flat) >= stop_after:
+            stopped = i < n  # only "more" if unprocessed files remain
+            break
+    return flat, stopped
+
+
+def finalize_matches(flat, backend, max_count):
+    """Pick and prepare the display set:
+
+    1. group all gathered matches by session (object identity — parent and
+       subagent transcripts share a sessionId but are distinct sessions);
+    2. rank sessions by recency (provisional, content-based) and take whole
+       sessions until we have `max_count` matches;
+    3. enrich only those displayed sessions (topic + position index + true span);
+    4. re-rank by the true span and flatten, newest session first / chronological
+       within a session; truncate to `max_count`.
+    """
+    groups = []  # (session, [matches in file order]) preserving first-seen order
+    by_id = {}
+    for m in flat:
+        g = by_id.get(id(m.session))
+        if g is None:
+            g = (m.session, [])
+            by_id[id(m.session)] = g
+            groups.append(g)
+        g[1].append(m)
+
+    # Rank sessions newest-first by provisional recency, accumulate whole
+    # sessions until we have enough matches to fill the display.
+    groups.sort(key=lambda g: g[0].end_ts or "", reverse=True)
+    chosen, count = [], 0
+    for session, ms in groups:
+        chosen.append((session, ms))
+        count += len(ms)
+        if count >= max_count:
+            break
+
+    if backend:  # light gather has no position index; fill it for displayed only
+        for session, ms in chosen:
+            idx = enrich_session(session)
+            for m in ms:
+                info = idx.get(m.lineno)
+                if info:
+                    m.pos, m.total, m.upos, m.utotal = info
+
+    # Final ordering uses the true span; keep each session's matches contiguous
+    # and chronological so the renderer draws exactly one box per session.
+    chosen.sort(key=lambda g: g[0].end_ts or "", reverse=True)
+    display = []
+    for session, ms in chosen:
+        ms.sort(key=lambda m: m.timestamp or "")
+        display.extend(ms)
+    return display[:max_count]
+
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+
+
+def highlight(text: str, regex, C: Theme) -> str:
+    if not C.enabled:
+        return text
+    return regex.sub(
+        lambda m: f"{C.ORANGE}{C.BOLD}{m.group(0)}{C.RESET}", text)
+
+
+def render_results(matches, total_found, args, regex, C: Theme, more=False) -> str:
+    out = []
+    pat = args.pattern
+    shown = len(matches)
+    tf = f"{total_found}+" if more else str(total_found)
+
+    out.append("")
+    out.append(
+        f"  {C.TEAL}{C.BOLD}  claudegrep{C.RESET}  "
+        f"{C.ORANGE}{C.BOLD}/{pat}/{C.RESET}  {C.SLATE}·{C.RESET}  "
+        f"{C.WHITE}{C.BOLD}{shown}{C.RESET} {C.SLATE}of {tf} "
+        f"result(s){C.RESET}")
+    out.append("")
+
+    prev = None
+    for m in matches:
+        s = m.session
+        if s is not prev:  # by identity: parent & subagent share a sessionId
+            if prev is not None:
+                out.append("")
+            out.extend(_render_session_box(s, C))
+            prev = s
+        out.extend(_render_match_row(m, args, regex, C))
+
+    if more or total_found > shown:
+        out.append(
+            f"  {C.SLATE}showing first {C.WHITE}{C.BOLD}{shown}{C.RESET}"
+            f"{C.SLATE} of {tf} — use {C.MINT}-m{C.RESET}"
+            f"{C.SLATE} to increase{C.RESET}")
+        out.append("")
+    return "\n".join(out)
+
+
+def _render_session_box(s: Session, C: Theme) -> list[str]:
+    inner = BOX_W - 4
+    hbar = "─" * BOX_W
+    rows = [f"  {C.CLOUD}╭{hbar}╮{C.RESET}"]
+
+    def boxline(plain, color):
+        padded = pad_to(plain, inner)
+        return (f"  {C.CLOUD}│{C.RESET}{C.BG_BOX}  {color}{padded}{C.RESET}"
+                f"{C.BG_BOX}  {C.RESET}{C.CLOUD}│{C.RESET}")
+
+    label = s.topic
+    if s.is_subagent:
+        label = "↳ " + label
+    rows.append(boxline(label, f"{C.TEAL}{C.BOLD}"))
+
+    meta = []
+    if s.branch:
+        meta.append(s.branch)
+    if s.cwd:
+        meta.append(shorten_path(s.cwd))
+    if meta:
+        rows.append(boxline("  ·  ".join(meta), C.SKY))
+
+    if s.start_ts:
+        sfmt = fmt_ts_long(s.start_ts)
+        efmt = fmt_ts_long(s.end_ts) if s.end_ts else ""
+        time_str = f"{sfmt} → {efmt}" if efmt and efmt != sfmt else sfmt
+        if time_str:
+            rows.append(boxline(time_str, C.GOLD))
+
+    if s.session_id:
+        rows.append(boxline(f"↻ claude --resume {s.session_id}", C.SLATE))
+
+    rows.append(f"  {C.CLOUD}╰{hbar}╯{C.RESET}")
+    return rows
+
+
+def _render_match_row(m: Match, args, regex, C: Theme) -> list[str]:
+    rows = []
+    ts_fmt = fmt_ts_short(m.timestamp) if m.timestamp else ""
+
+    pos_str = ""
+    if m.pos:
+        if m.msg_type == "user" and m.upos:
+            pos_str = (f"{C.SLATE}depth{C.RESET}  🧑 {C.PEACH}{m.pos}{C.RESET}"
+                       f"{C.SLATE}/{m.total}{C.RESET}  🧑{C.SLATE}+{C.RESET}🤖 "
+                       f"{C.PEACH}{m.upos}{C.RESET}{C.SLATE}/{m.utotal}{C.RESET}")
+        else:
+            pos_str = (f"{C.SLATE}depth{C.RESET}  🧑 {C.PEACH}{m.pos}{C.RESET}"
+                       f"{C.SLATE}/{m.total}{C.RESET}")
+
+    if m.msg_type == "user":
+        rows.append(f"    {C.MINT}{C.BOLD}▸ you{C.RESET}    "
+                    f"{C.FAINT}{ts_fmt}{C.RESET}    {pos_str}")
+    else:
+        rows.append(f"    {C.LAVENDER}{C.BOLD}▸ claude{C.RESET} "
+                    f"{C.FAINT}{ts_fmt}{C.RESET}    {pos_str}")
+
+    body = excerpt(m.text, regex, full=args.full)
+    for line in body.split("\n"):
+        rows.append(f"      {highlight(line, regex, C)}")
+    rows.append("")
+    return rows
+
+
+def excerpt(text: str, regex, full: bool, limit: int = 500) -> str:
+    """Trim a body for display. When not full, window around the first match so
+    the highlighted hit is always visible."""
+    if full or len(text) <= limit:
+        return text
+    mo = regex.search(text)
+    start = mo.start() if mo else 0
+    begin = max(0, start - 80)
+    window = text[begin:begin + limit]
+    prefix = "…" if begin > 0 else ""
+    suffix = "…" if begin + limit < len(text) else ""
+    return prefix + window + suffix
+
+
+def shorten_path(p: str) -> str:
+    home = os.path.expanduser("~")
+    if p.startswith(home):
+        return "~" + p[len(home):]
+    return p
+
+
+# ── Alternate output modes ────────────────────────────────────────────────────
+
+
+def emit_json(matches, jsonl: bool):
+    payload = [{
+        "sessionId": m.session.session_id,
+        "project": m.session.project,
+        "topic": m.session.topic,
+        "type": m.msg_type,
+        "timestamp": m.timestamp,
+        "gitBranch": m.session.branch,
+        "cwd": m.session.cwd,
+        "pos": m.pos, "total": m.total,
+        "upos": m.upos, "utotal": m.utotal,
+        "file": str(m.session.path),
+        "lineno": m.lineno,
+        "resume": f"claude --resume {m.session.session_id}",
+        "text": m.text,
+    } for m in matches]
+    if jsonl:
+        return "\n".join(json.dumps(p, ensure_ascii=False) for p in payload)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def render_plain(matches, total_found, args, regex, more=False):
+    """Regular (agent/non-TTY) mode: readable, ANSI-free, session-grouped, and
+    token-efficient. Carries the resume id + file path so a result is directly
+    actionable, without box-drawing or color a parser would have to strip."""
+    tf = f"{total_found}+" if more else str(total_found)
+    out = [f"claudegrep /{args.pattern}/  —  {len(matches)} of {tf} result(s)"]
+    prev = None
+    for m in matches:
+        s = m.session
+        if s is not prev:
+            out.append("")
+            tag = "↳ " if s.is_subagent else ""
+            out.append(f"## {tag}{s.topic}")
+            meta = []
+            if s.branch:
+                meta.append(s.branch)
+            if s.cwd:
+                meta.append(shorten_path(s.cwd))
+            if m.timestamp or s.start_ts:
+                span = fmt_ts_long(s.start_ts or "")
+                efmt = fmt_ts_long(s.end_ts or "")
+                if efmt and efmt != span:
+                    span = f"{span} → {efmt}"
+                if span:
+                    meta.append(span)
+            if meta:
+                out.append("   " + "  |  ".join(meta))
+            out.append(f"   resume: claude --resume {s.session_id}")
+            out.append(f"   file:   {s.path}")
+            prev = s
+        who = "you" if m.msg_type == "user" else "claude"
+        when = fmt_ts_short(m.timestamp) if m.timestamp else ""
+        depth = f"{m.pos}/{m.total}"
+        text = excerpt(m.text, regex, full=args.full)
+        text = " ".join(text.split())  # collapse whitespace for one-line rows
+        out.append(f"   [{who} {when} · {depth}] {text}")
+    if more or total_found > len(matches):
+        out.append("")
+        extra = f"{total_found - len(matches)}+" if more else str(total_found - len(matches))
+        out.append(f"… {extra} more — raise with -m N")
+    return "\n".join(out)
+
+
+def emit_grep(matches):
+    lines = []
+    for m in matches:
+        text = " ".join(m.text.split())
+        lines.append(f"{m.session.path}:{m.lineno}:{text}")
+    return "\n".join(lines)
+
+
+def emit_count(matches, args, C: Theme):
+    from collections import Counter
+    by_project = Counter(m.session.project for m in matches)
+    by_session = Counter(m.session.session_id for m in matches)
+    out = [""]
+    out.append(f"  {C.WHITE}{C.BOLD}{len(matches)}{C.RESET} "
+               f"{C.SLATE}matches across {len(by_session)} session(s), "
+               f"{len(by_project)} project(s){C.RESET}")
+    out.append("")
+    for proj, n in by_project.most_common():
+        out.append(f"    {C.SKY}{pad_to(proj, 46)}{C.RESET} "
+                   f"{C.PEACH}{n:>4}{C.RESET}")
+    out.append("")
+    return "\n".join(out)
+
+
+# ── Project listing & recent dashboard ────────────────────────────────────────
+
+
+def list_projects(C: Theme):
+    from collections import Counter
+    out = [f"{C.TEAL}{C.BOLD}Claude Code Projects{C.RESET}", ""]
+    main, _ = walk_transcripts()
+    if not main:
+        out.append("  (no projects directory)")
+        print("\n".join(out))
+        return
+    counts = Counter(project_of(p) for p in main)
+    for name in sorted(counts):
+        out.append(f"  {C.SKY}{pad_to(name, 50)}{C.RESET} "
+                   f"{C.SLATE}{counts[name]:>3} sessions{C.RESET}")
+    print("\n".join(out))
+
+
+def light_scan(path: Path):
+    """Cheap metadata-only scan for the dashboard: topic + span + branch/cwd."""
+    ai_title = None
+    sid = branch = cwd = None
+    timed = []
+    first_user = None
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if not any(g in raw for g in _GATE):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                t = rec.get("type")
+                if t == "ai-title":
+                    at = rec.get("aiTitle")
+                    if at:
+                        ai_title = at
+                    continue
+                if t not in ("user", "assistant"):
+                    continue
+                sid = sid or rec.get("sessionId")
+                branch = branch or rec.get("gitBranch")
+                cwd = cwd or rec.get("cwd")
+                ts = rec.get("timestamp")
+                if ts:
+                    timed.append(ts)
+                if first_user is None and t == "user":
+                    txt = record_text(rec, False).strip()
+                    if len(txt) > 10 and not txt.startswith(_TOPIC_NOISE_PREFIXES):
+                        first_user = txt[:60]
+    except OSError:
+        return None
+    if not sid:
+        return None
+    return Session(
+        session_id=sid, path=path, project=project_of(path),
+        topic=ai_title or first_user or f"Session {sid[:8]}…",
+        branch=branch, cwd=cwd,
+        start_ts=min(timed) if timed else None,
+        end_ts=max(timed) if timed else None, is_subagent=False)
+
+
+def recent_dashboard(C: Theme, limit: int = 12):
+    mains, _ = walk_transcripts()
+    if not mains:
+        print("  (no projects directory)")
+        return
+    mains.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    out = ["",
+           f"  {C.TEAL}{C.BOLD}  claudegrep{C.RESET}  "
+           f"{C.SLATE}— recent sessions{C.RESET}", ""]
+    for path in mains[:limit]:
+        s = light_scan(path)
+        if not s:
+            continue
+        when = fmt_ts_long(s.end_ts) if s.end_ts else ""
+        out.append(f"  {C.TEAL}{C.BOLD}{truncate_to_width(s.topic, 60)}{C.RESET}")
+        meta = []
+        if s.branch:
+            meta.append(s.branch)
+        if s.cwd:
+            meta.append(shorten_path(s.cwd))
+        out.append(f"    {C.SKY}{'  ·  '.join(meta)}{C.RESET}")
+        out.append(f"    {C.GOLD}{when}{C.RESET}   "
+                   f"{C.SLATE}↻ claude --resume {s.session_id}{C.RESET}")
+        out.append("")
+    out.append(f"  {C.SLATE}search with {C.MINT}claudegrep <pattern>{C.RESET}"
+               f"{C.SLATE}; list projects with {C.MINT}--list-projects{C.RESET}")
+    out.append("")
+    print("\n".join(out))
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claudegrep", add_help=True,
+        description="Search Claude Code conversation logs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("pattern", nargs="?", help="search pattern (regex by default)")
+
+    who = p.add_argument_group("who").add_mutually_exclusive_group()
+    who.add_argument("-u", "--user", dest="user_only", action="store_true",
+                     help="user messages only")
+    who.add_argument("-a", "--assistant", dest="assistant_only",
+                     action="store_true", help="assistant/agent messages only")
+
+    matchg = p.add_argument_group("matching")
+    matchg.add_argument("-s", "--case-sensitive", action="store_true",
+                        help="case-sensitive (default: smart-case)")
+    matchg.add_argument("-i", "--ignore-case", action="store_true",
+                        help="force case-insensitive")
+    matchg.add_argument("-F", "--fixed-strings", action="store_true",
+                        help="treat pattern as a literal string")
+    matchg.add_argument("-w", "--word", action="store_true",
+                        help="match whole words only")
+    matchg.add_argument("--all-content", action="store_true",
+                        help="also search tool calls and tool output")
+
+    scope = p.add_argument_group("scope")
+    scope.add_argument("-p", "--project", metavar="SUBSTR",
+                       help="filter to projects whose dir name contains SUBSTR")
+    scope.add_argument("--session", metavar="ID", help="search one session id")
+    scope.add_argument("--last", action="store_true",
+                       help="search only the most recently active session")
+    scope.add_argument("--branch", metavar="SUBSTR", help="filter by git branch")
+    scope.add_argument("--cwd", metavar="SUBSTR", help="filter by working dir")
+    scope.add_argument("--since", metavar="DATE", help="only matches on/after DATE (YYYY-MM-DD)")
+    scope.add_argument("--until", metavar="DATE", help="only matches on/before DATE")
+    scope.add_argument("--days", type=int, metavar="N",
+                       help="only matches from the last N days")
+    scope.add_argument("--include-subagents", action="store_true",
+                       help="also search subagent transcripts")
+
+    outg = p.add_argument_group("output")
+    outg.add_argument("-m", "--max-count", "-n", dest="max_count", type=int,
+                      default=DEFAULT_MAX,
+                      help=f"max results (default {DEFAULT_MAX}; -n is an alias)")
+    outg.add_argument("--full", action="store_true",
+                      help="show full message bodies (no 500-char trim)")
+    # Output mode. Default auto-detects: rich on a TTY (human), plain otherwise
+    # (piped / run by an agent). Override with the flags below or CLAUDEGREP_MODE.
+    outg.add_argument("--rich", dest="mode", action="store_const", const="rich",
+                      help="force rich colorized output (human)")
+    outg.add_argument("--plain", dest="mode", action="store_const", const="plain",
+                      help="force plain readable output (agent/pipe)")
+    outg.add_argument("--json", dest="mode", action="store_const", const="json",
+                      help="emit a JSON array")
+    outg.add_argument("--jsonl", dest="mode", action="store_const", const="jsonl",
+                      help="emit JSON lines")
+    outg.add_argument("--grep", dest="mode", action="store_const", const="grep",
+                      help="emit path:line:text (editor-friendly)")
+    outg.add_argument("--count", dest="mode", action="store_const", const="count",
+                      help="show match counts per project")
+    outg.add_argument("--no-color", action="store_true", help="disable color")
+    outg.add_argument("--no-pager", action="store_true", help="do not page output")
+    outg.add_argument("--list-projects", action="store_true",
+                      help="list projects and exit")
+    p.set_defaults(mode=None)
+    return p
+
+
+# Modes that emit structured / non-decorated output and need a fixed shape.
+_JSONISH = {"json", "jsonl"}
+
+
+def resolve_format(args) -> str:
+    """Pick the output mode. Explicit flag > CLAUDEGREP_MODE env > TTY auto."""
+    if args.mode:
+        return args.mode
+    env = os.environ.get("CLAUDEGREP_MODE", "").strip().lower()
+    if env in ("rich", "plain", "json", "jsonl", "grep", "count"):
+        return env
+    return "rich" if sys.stdout.isatty() else "plain"
+
+
+def color_enabled(fmt: str, args) -> bool:
+    if fmt != "rich":
+        return False
+    if args.no_color or os.environ.get("NO_COLOR") is not None:
+        return False
+    return True
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    fmt = resolve_format(args)
+    C = Theme(color_enabled(fmt, args))
+
+    if args.list_projects:
+        list_projects(C)
+        return 0
+
+    if not args.pattern:
+        if fmt == "rich":
+            recent_dashboard(C)
+        else:
+            recent_dashboard(Theme(False))
+        return 0
+
+    if args.max_count is not None and args.max_count <= 0:
+        sys.stderr.write("claudegrep: -m/--max-count must be a positive integer\n")
+        return 2
+
+    resolve_case_sensitivity(args)
+    regex = compile_pattern(args)
+
+    files = discover_files(args)
+    if not files:
+        scope = "session/project" if (args.project or args.session) else "logs"
+        sys.stderr.write(f"claudegrep: no matching {scope} under {PROJECTS_DIR}\n")
+        return 1
+
+    # Pick the best backend (rg → grep → Python). Only rg gets a cheap up-front
+    # candidate-narrowing pass; grep and Python scan all files newest-first and
+    # rely on the batched early-stop in gather_matches to bound common patterns.
+    # --count needs every match; display modes early-stop after the most-recent N.
+    backend = choose_backend(args)
+    had_raw_hits = False
+    search_set = files
+    if backend == "rg":
+        cand = rg_list_files(args.pattern, files, args)
+        if cand is None:        # rg present but couldn't compile this pattern
+            backend = None
+        else:
+            search_set = cand
+            had_raw_hits = bool(cand)
+    scan_files = sorted(search_set, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    stop_after = None if fmt == "count" else max(args.max_count * 4, 100)
+    flat, stopped = gather_matches(scan_files, backend, args.pattern,
+                                   regex, args, stop_after=stop_after)
+    total_found = len(flat)
+
+    if total_found == 0:
+        return _no_matches(args, fmt, had_raw_hits, C)
+
+    if fmt == "count":
+        print(emit_count(flat, args, C))
+        return 0
+
+    matches = finalize_matches(flat, backend, args.max_count)
+
+    if fmt in _JSONISH:
+        print(emit_json(matches, fmt == "jsonl"))
+        return 0
+    if fmt == "grep":
+        print(emit_grep(matches))
+        return 0
+    if fmt == "plain":
+        print(render_plain(matches, total_found, args, regex, more=stopped))
+        return 0
+
+    rendered = render_results(matches, total_found, args, regex, C, more=stopped)
+    _output(rendered, args)
+    return 0
+
+
+def _no_matches(args, fmt, had_raw_hits, C: Theme) -> int:
+    pat = args.pattern
+    if fmt in _JSONISH:
+        print("[]")
+        return 0
+    if fmt in ("grep", "count"):
+        return 0
+    # Nudge: the term is in the raw logs but not in conversation text. It may be
+    # in tool calls/output (which --all-content searches) or only in metadata.
+    hint = ""
+    if not args.all_content and had_raw_hits:
+        hint = ("\n  (present in the raw logs but not conversation text — try "
+                "--all-content to also search tool calls/output)" if fmt == "plain"
+                else f"\n  {C.SLATE}(present in the raw logs but not conversation "
+                f"text — try {C.MINT}--all-content{C.RESET}{C.SLATE} to also search "
+                f"tool calls/output){C.RESET}")
+    if fmt == "plain":
+        print(f"claudegrep /{pat}/  —  no matches{hint}")
+    else:
+        print(f"\n  {C.SLATE}No matches for{C.RESET} "
+              f"{C.ORANGE}{C.BOLD}/{pat}/{C.RESET}{hint}\n")
+    return 0
+
+
+def _output(rendered: str, args):
+    use_pager = (not args.no_pager) and sys.stdout.isatty()
+    if use_pager and shutil.which("less"):
+        try:
+            proc = subprocess.Popen(["less", "-RFX"], stdin=subprocess.PIPE,
+                                    text=True)
+            proc.communicate(rendered + "\n")
+            return
+        except (OSError, BrokenPipeError):
+            pass
+    print(rendered)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

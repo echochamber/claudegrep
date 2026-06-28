@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudegrep"
+version = "0.1.0"
+description = "Search Claude Code conversation logs with rich (human) or plain (agent) output"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Jason Schein" }]
+keywords = ["claude", "claude-code", "grep", "search", "cli", "logs", "transcripts"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/echochamber/claudegrep"
+Repository = "https://github.com/echochamber/claudegrep"
+Issues = "https://github.com/echochamber/claudegrep/issues"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+# This project ships a single self-contained script (no importable modules), so
+# tell setuptools not to go hunting for packages and to install the script as-is.
+[tool.setuptools]
+py-modules = []
+script-files = ["claudegrep"]
